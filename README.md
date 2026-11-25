@@ -1,2 +1,4 @@
 # traject0ry
-zombie
+patch notes:
+
+game demo is out
