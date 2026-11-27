@@ -1270,7 +1270,9 @@ function updateFoes(dt){
       STEPT[r.id] = (STEPT[r.id] || 0) + dt;
       if (STEPT[r.id] >= STEP_T){ STEPT[r.id] = 0; noise(r.x, r.y, r.sprint ? 180 : 120); }
     }
-    GAME_T += dt; if (GAME_T >= WAVE.next){ spawnWave(); WAVE.next = GAME_T + 5; }
+    GAME_T += dt;
+    spawnPendingWaveFoes();
+    if (!WAVE.active && GAME_T >= WAVE.next){ spawnWave(); spawnPendingWaveFoes(); }
   }
   const px = P.x, py = P.y - 4, T = targetList().filter(t => t.id !== 'me' || !PL.dead);
   const PACK = packSlots(T);
@@ -1372,7 +1374,7 @@ function resetGame(){
   for (const q of ATK.pops) q.el.remove();
   ATK.pops = [];
   Object.assign(DUM, { x: 160, y: 66, vx: 0, vy: 0, hp: DUM.max, hitT: 0, respawn: 0 });
-  FOES.length = 0; GAME_T = 0; FOE_SPAWNED = false; WAVE.n = 0; WAVE.next = 30; PINGS.length = 0;
+  FOES.length = 0; GAME_T = 0; FOE_SPAWNED = false; WAVE.n = 0; WAVE.next = 30; WAVE.pending.length = 0; WAVE.active = false; PINGS.length = 0;
   tl = 171;
   hudEl.classList.remove('on');
   menuEl.style.display = ''; menuEl.classList.remove('gone');
@@ -1694,7 +1696,12 @@ function releaseAttack(){ if (activeType() === 'thrown') throwWeapon(); else if 
 
 /* ---------- zombie types: crawler, bloater, lurker, volatile, tank ---------- */
 const GAS = [];
-function spawnFoe(def, x, y){ const e = mkFoe(def, x, y); e.hidden = def.key === 'lurker'; FOES.push(e); return e; }
+const MAX_FOES = 100;
+function activeFoeCount(){ return FOES.filter(e => !e.dead && !e.gone && e.dying <= 0).length; }
+function spawnFoe(def, x, y){
+  if (activeFoeCount() >= MAX_FOES) return null;
+  const e = mkFoe(def, x, y); e.hidden = def.key === 'lurker'; FOES.push(e); return e;
+}
 function onFoeDeath(e){
   if (e.def.key === 'bloater') GAS.push({ x: e.x, y: e.y, t: 0 });
   if (e.def.key === 'tank' && amHost()) spawnFoe(FOE.crawler, e.x, e.y);     // the corpse turns into a crawler
@@ -1833,16 +1840,23 @@ function drawShaft(x0, y0, x1, y1){
 }
 
 /* ---------- waves, pack flanking, pings, names, sound, medkit healing ---------- */
-const WAVE = { n: 0, next: 30 };
+const WAVE = { n: 0, next: 30, pending: [], active: false };
 let waveShown = -1;
-function spawnAway(def){
+function spawnAway(def, allowPair){
   const T = targetList(), base = T[0];
   for (let t = 0; t < 400; t++){
     const a = Math.random() * Math.PI * 2, d = 220 + Math.random() * 260;
     const x = base.x + Math.cos(a) * d, y = base.y + Math.sin(a) * d;
     if (blockedAt(x, y, 2, 2) || T.some(q => Math.hypot(x - q.x, y - q.y) < 160)) continue;
-    spawnFoe(def, x, y); return;
+    if (!spawnFoe(def, x, y)) return 0;
+    let spawned = 1;
+    if (allowPair && Math.random() < .33){           // a third of the time, a pair
+      const ox = x + (Math.random() - .5) * 40, oy = y + (Math.random() - .5) * 40;
+      if (!blockedAt(ox, oy, 2, 2) && spawnFoe(def, ox, oy)) spawned++;
+    }
+    return spawned;
   }
+  return 0;
 }
 function spawnWave(){                                  // each wave is bigger and brings newer kinds
   WAVE.n++;
@@ -1851,7 +1865,17 @@ function spawnWave(){                                  // each wave is bigger an
   if (WAVE.n >= 3) pool.push(FOE.bloater, FOE.volatile, FOE.crawler);
   if (WAVE.n >= 4) pool.push(FOE.lurker, FOE.tank);
   const count = 8 + WAVE.n * 4;
-  for (let k = 0; k < count; k++) spawnAway(pool[Math.floor(Math.random() * pool.length)]);
+  for (let k = 0; k < count; k++) WAVE.pending.push(pool[Math.floor(Math.random() * pool.length)]);
+  WAVE.active = true;
+}
+function spawnPendingWaveFoes(){
+  while (WAVE.pending.length && activeFoeCount() < MAX_FOES){
+    const def = WAVE.pending[0], allowPair = WAVE.pending[1] === def && activeFoeCount() < MAX_FOES - 1;
+    const spawned = spawnAway(def, allowPair);
+    if (!spawned) break;
+    WAVE.pending.splice(0, spawned);
+  }
+  if (WAVE.active && !WAVE.pending.length){ WAVE.active = false; WAVE.next = GAME_T + 15; }
 }
 function showWave(){
   const roster = onlineNow() ? window.NET.roster : [];
@@ -1993,25 +2017,45 @@ function thump(vol){
   g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(.001, t + .25);
   o.connect(g).connect(AC.destination); o.start(t); o.stop(t + .26);
 }
-function groan(vol){
+function groan(vol, pitch){
   const len = Math.floor(AC.sampleRate * 1.2), buf = AC.createBuffer(1, len, AC.sampleRate), d = buf.getChannelData(0);
   for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.sin(Math.PI * i / len);
   const src = AC.createBufferSource(), f = AC.createBiquadFilter(), g = AC.createGain();
-  src.buffer = buf; f.type = 'bandpass'; f.frequency.value = 180; f.Q.value = 3; g.gain.value = vol;
+  src.buffer = buf; f.type = 'bandpass'; f.frequency.value = 180 * (pitch || 1); f.Q.value = 3; g.gain.value = vol;
   src.connect(f).connect(g).connect(AC.destination); src.start();
 }
 function audioTick(dt){
   if (!AC || !started || INV.open) return;
-  let near = 1e9;
-  for (const e of FOES) if (!e.dead) near = Math.min(near, Math.hypot(e.x - P.x, e.y - P.y));
-  if (near < 220){
+  let near = 1e9, budget = 2;
+  for (const e of FOES){
+    if (e.dead || e.gone || e.dying > 0 || e.hidden) continue;
+    const d = Math.hypot(e.x - P.x, e.y - P.y);
+    if (d < near) near = d;
+    if (d > 420) continue;
+    const vol = 1 - d / 420;
+    e.groanT = (e.groanT === undefined ? 1 + Math.random() * 5 : e.groanT) - dt;          // each zombie groans on its own clock
+    if (e.groanT <= 0 && budget > 0){ groan(.05 + .12 * vol, e.def.key === 'runner' ? 1.5 : e.def.key === 'tank' ? .6 : 1); e.groanT = 4 + Math.random() * 6; budget--; }
+    if (e.moving){                                                                        // footsteps; quicker for faster kinds
+      e.stepT = (e.stepT || 0) + dt;
+      const every = .55 / Math.max(.5, e.def.speed / 275);
+      if (e.stepT >= every && budget > 0){ e.stepT = 0; burst(.06, 260, 120, 'lowpass', .22 * vol); budget--; }
+    }
+    if (e.def.key === 'bloater' && !e.dead){                                              // a low rumble every couple of seconds
+      e.rumbleT = (e.rumbleT === undefined ? 1 : e.rumbleT) - dt;
+      if (e.rumbleT <= 0 && budget > 0){ tone(55, .4, .12 * vol); e.rumbleT = 2; budget--; }
+    }
+  }
+  if (GAS.some(g => Math.hypot(g.x - P.x, g.y - P.y) < 120)){                           // gas hiss when you're in it
+    hbT -= 0;
+    if (!audioTick.hissT || audioTick.hissT <= 0){ burst(.4, 3000, 1500, 'bandpass', .1); audioTick.hissT = .4; }
+  }
+  if (audioTick.hissT > 0) audioTick.hissT -= dt;
+  audioTick.gustT = (audioTick.gustT === undefined ? 6 : audioTick.gustT) - dt;           // a little wind now and then
+  if (audioTick.gustT <= 0){ burst(2, 400, 200, 'lowpass', .04); audioTick.gustT = 8 + Math.random() * 8; }
+  if (near < 220){                                                                        // heartbeat, faster the closer they are
     const k = 1 - near / 220;
     hbT -= dt;
     if (hbT <= 0){ thump(.15 + .35 * k); hbT = .95 - .55 * k; }
-  }
-  if (FOES.some(e => !e.dead)){
-    grT -= dt;
-    if (grT <= 0){ groan(.05 + .08 * Math.random()); grT = 5 + Math.random() * 6; }
   }
 }
 addEventListener('net-error', e => { $(ovAuth.classList.contains('on') ? 'authMsg' : 'lobbyMsg').textContent = e.detail; });
